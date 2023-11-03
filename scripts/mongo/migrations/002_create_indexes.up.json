@@ -1,0 +1,28 @@
+[
+  {
+    "createIndexes": "redirect",
+    "indexes": [
+      {
+        "name": "id",
+        "key": {
+          "id": 1
+        },
+        "unique": true
+      },
+      {
+        "name": "dns",
+        "key": {
+          "dns": 1
+        },
+        "unique": false
+      },
+      {
+        "name": "uri",
+        "key": {
+          "uri": 1
+        },
+        "unique": false
+      }
+    ]
+  }
+]

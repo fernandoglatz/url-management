@@ -1,0 +1,6 @@
+[
+  {
+    "dropIndexes": "redirect",
+    "indexes": ["id", "dns", "uri"]
+  }
+]
