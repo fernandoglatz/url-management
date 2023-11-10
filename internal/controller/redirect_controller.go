@@ -193,15 +193,20 @@ func (controller *RedirectController) Execute(ginCtx *gin.Context) {
 	ctx := GetContext(ginCtx)
 	id := ginCtx.Query("to")
 
-	log.Info(ctx).Msg(fmt.Sprintf("Executing redirect %s", id))
+	if len(id) > constants.ZERO {
+		log.Info(ctx).Msg(fmt.Sprintf("Executing redirect %s", id))
 
-	redirect, err := controller.service.Get(ctx, id)
-	if err != nil {
-		HandleError(ctx, ginCtx, err)
-		return
+		redirect, err := controller.service.Get(ctx, id)
+		if err != nil {
+			HandleError(ctx, ginCtx, err)
+			return
+		}
+
+		controller.redirect(ctx, ginCtx, redirect)
+
+	} else {
+		controller.NoRoute(ginCtx)
 	}
-
-	controller.redirect(ctx, ginCtx, redirect)
 }
 
 func (controller *RedirectController) NoRoute(ginCtx *gin.Context) {
