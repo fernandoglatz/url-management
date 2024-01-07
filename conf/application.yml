@@ -1,0 +1,20 @@
+server:
+  listening: "0.0.0.0:8080"
+  context-path: "/url-management"
+
+data:
+  mongo:
+    uri: "mongodb://mongo:27017"
+    database: "url-management"
+
+  redis:
+    address: "redis:6379"
+    password: ""
+    db: 0
+    ttl:
+      redirect: 24h
+
+log:
+  level: TRACE
+  format: TEXT
+  colored: true
