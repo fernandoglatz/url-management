@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/render"
@@ -244,30 +245,26 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 		body := ginCtx.Request.Body
 		method := ginCtx.Request.Method
 		headers := ginCtx.Request.Header
+		domain := ginCtx.Request.Host
 
 		if uri == "/" {
 			uri = urlDestination.RequestURI()
 		}
 
 		destination := urlDestination.Scheme + "://" + urlDestination.Hostname()
+		destinationDomain := urlDestination.Hostname()
 
 		defer body.Close()
 
 		request, _ := http.NewRequest(method, destination+uri, body)
 		for key, values := range headers {
-			value := values[constants.ZERO]
-
-			if key == "Host" || key == "Origin" {
-				value = destination
-
-			} else if key == "Referer" {
-				urlReferer, err := urlDestination.Parse(value)
-				if err == nil {
-					value = destination + urlReferer.Path
-				}
+			newValues := make([]string, len(values))
+			for _, value := range values {
+				newValue := strings.ReplaceAll(value, domain, destinationDomain)
+				newValues = append(newValues, newValue)
 			}
 
-			request.Header.Set(key, value)
+			request.Header[key] = newValues
 		}
 
 		response, err := client.Do(request)

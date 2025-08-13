@@ -8,5 +8,13 @@
         "**/Thumbs.db": true,
         ".history": true
     },
-    "explorerExclude.backup": {}
+    "explorerExclude.backup": {},
+    "workbench.colorCustomizations": {
+        "statusBar.background": "#75be3a",
+        "statusBar.foreground": "#15202b",
+        "statusBarItem.hoverBackground": "#5d972e",
+        "statusBarItem.remoteBackground": "#75be3a",
+        "statusBarItem.remoteForeground": "#15202b"
+    },
+    "peacock.color": "#75be3a"
 }

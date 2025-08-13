@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"errors"
-	"fernandoglatz/url-management/internal/core/common/utils"
 	"fernandoglatz/url-management/internal/core/common/utils/constants"
 	"fernandoglatz/url-management/internal/core/common/utils/exceptions"
 	"fernandoglatz/url-management/internal/core/common/utils/log"
@@ -16,14 +15,6 @@ import (
 )
 
 const FORMAT_TRACE_STR = "[%.3fms] HTTP %d %s %s %s"
-
-func putTraceNotEmpty(ginCtx *gin.Context, traceMap map[string]any, headerName string) {
-	header, _ := GetHeader(ginCtx, headerName, false)
-
-	if utils.IsNotEmptyStr(header) {
-		traceMap[headerName] = header
-	}
-}
 
 func TraceMiddleware() gin.HandlerFunc {
 	return func(ginCtx *gin.Context) {
