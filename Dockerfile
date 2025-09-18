@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine as go-alpine
+FROM golang:1.25-alpine as go-alpine
 RUN apk --no-cache add tzdata
 COPY . /go/src
 WORKDIR /go/src
