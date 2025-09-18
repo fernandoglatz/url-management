@@ -288,14 +288,17 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 
 		for key, values := range response.Header {
 			for _, value := range values {
-				if strings.ToLower(key) == "set-cookie" {
-					ginCtx.Writer.Header().Add(key, value)
-				}
-
 				newValue := strings.ReplaceAll(value, destinationDomain, domain)
 				newValue = strings.ReplaceAll(newValue, destinationRootDomain, domain)
 				ginCtx.Writer.Header().Add(key, newValue)
 			}
+		}
+
+		if isTextBasedContent(contentType) {
+			responseBodyStr := string(responseBody)
+			responseBodyStr = strings.ReplaceAll(responseBodyStr, destinationDomain, domain)
+			responseBodyStr = strings.ReplaceAll(responseBodyStr, destinationRootDomain, domain)
+			responseBody = []byte(responseBodyStr)
 		}
 
 		ginCtx.Render(response.StatusCode, render.Data{
@@ -306,4 +309,31 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 	} else {
 		ginCtx.Redirect(http.StatusTemporaryRedirect, redirect.Destination)
 	}
+}
+
+func isTextBasedContent(contentType string) bool {
+	textTypes := []string{
+		"text/html",
+		"text/css",
+		"text/javascript",
+		"application/javascript",
+		"application/x-javascript",
+		"text/plain",
+		"application/json",
+		"application/xml",
+		"text/xml",
+		"application/xhtml+xml",
+		"text/csv",
+		"application/rss+xml",
+		"application/atom+xml",
+	}
+
+	contentTypeLower := strings.ToLower(contentType)
+	for _, textType := range textTypes {
+		if strings.Contains(contentTypeLower, textType) {
+			return true
+		}
+	}
+
+	return false
 }
