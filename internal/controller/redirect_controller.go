@@ -288,6 +288,10 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 
 		for key, values := range response.Header {
 			for _, value := range values {
+				if strings.ToLower(key) == "set-cookie" {
+					ginCtx.Writer.Header().Add(key, value)
+				}
+
 				newValue := strings.ReplaceAll(value, destinationDomain, domain)
 				newValue = strings.ReplaceAll(newValue, destinationRootDomain, domain)
 				ginCtx.Writer.Header().Add(key, newValue)
