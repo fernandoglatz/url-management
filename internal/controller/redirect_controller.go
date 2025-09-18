@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"strings"
 
+	"fernandoglatz/url-management/internal/core/common/utils"
+
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/render"
 )
@@ -253,6 +255,7 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 
 		destination := urlDestination.Scheme + "://" + urlDestination.Hostname()
 		destinationDomain := urlDestination.Hostname()
+		destinationRootDomain := utils.ExtractRootDomain(destinationDomain)
 
 		defer body.Close()
 
@@ -286,6 +289,7 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 		for key, values := range response.Header {
 			for _, value := range values {
 				newValue := strings.ReplaceAll(value, destinationDomain, domain)
+				newValue = strings.ReplaceAll(newValue, destinationRootDomain, domain)
 				ginCtx.Writer.Header().Add(key, newValue)
 			}
 		}
