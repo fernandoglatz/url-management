@@ -284,8 +284,10 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 		contentType := response.Header.Get("Content-Type")
 
 		for key, values := range response.Header {
-			value := values[constants.ZERO]
-			ginCtx.Header(key, value)
+			for _, value := range values {
+				newValue := strings.ReplaceAll(value, destinationDomain, domain)
+				ginCtx.Writer.Header().Add(key, newValue)
+			}
 		}
 
 		ginCtx.Render(response.StatusCode, render.Data{
