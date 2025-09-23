@@ -7,8 +7,6 @@ import (
 	"fernandoglatz/url-management/internal/infrastructure/config"
 	"time"
 
-	nrredis "github.com/newrelic/go-agent/v3/integrations/nrredis-v9"
-
 	"github.com/redis/go-redis/v9"
 )
 
@@ -28,7 +26,6 @@ func ConnectToRedis(ctx context.Context) error {
 		DB:       redisConfig.Db,
 	}
 	client := redis.NewClient(redisOptions)
-	client.AddHook(nrredis.NewHook(redisOptions))
 
 	RedisDatabase = redisDatabaseType{
 		Client: client,

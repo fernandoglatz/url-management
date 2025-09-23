@@ -8,7 +8,6 @@ require (
 	github.com/gin-gonic/gin v1.11.0
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
-	github.com/newrelic/go-agent/v3/integrations/nrredis-v9 v1.1.2
 	github.com/redis/go-redis/v9 v9.14.0
 	github.com/rs/zerolog v1.34.0
 	github.com/swaggo/files v1.0.1
@@ -43,7 +42,6 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect
-	github.com/newrelic/go-agent/v3 v3.40.1 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
 	github.com/quic-go/quic-go v0.54.0 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
@@ -53,8 +51,6 @@ require (
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/mod v0.28.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20250922171735-9219d122eba9 // indirect
-	google.golang.org/grpc v1.75.1 // indirect
 )
 
 require (
