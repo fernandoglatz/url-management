@@ -16,5 +16,7 @@
         "statusBarItem.remoteBackground": "#75be3a",
         "statusBarItem.remoteForeground": "#15202b"
     },
-    "peacock.color": "#75be3a"
+    "peacock.color": "#75be3a",
+    "AllAutocomplete.showCurrentDocument": false,
+    "postman.settings.dotenv-detection-notification-visibility": false
 }
