@@ -7,6 +7,7 @@ import (
 	"fernandoglatz/url-management/internal/core/common/utils/exceptions"
 	"fernandoglatz/url-management/internal/core/common/utils/log"
 	"fernandoglatz/url-management/internal/core/entity"
+	redirecttype "fernandoglatz/url-management/internal/core/entity/redirect"
 	"fernandoglatz/url-management/internal/core/model/request"
 	"fernandoglatz/url-management/internal/core/port/service"
 	"fmt"
@@ -234,7 +235,8 @@ func (controller *RedirectController) NoRoute(ginCtx *gin.Context) {
 }
 
 func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.Context, redirect entity.Redirect) {
-	if redirect.Proxy {
+	switch redirect.Type {
+	case redirecttype.PROXY:
 		client := &http.Client{}
 
 		urlDestination, err := url.Parse(redirect.Destination)
@@ -259,9 +261,24 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 
 		defer body.Close()
 
+		hopByHopHeaders := map[string]bool{
+			"Connection":          true,
+			"Keep-Alive":          true,
+			"Proxy-Connection":    true,
+			"Transfer-Encoding":   true,
+			"Upgrade":             true,
+			"Proxy-Authenticate":  true,
+			"Proxy-Authorization": true,
+			"Te":                  true,
+			"Trailers":            true,
+		}
+
 		request, _ := http.NewRequest(method, destination+uri, body)
 		for key, values := range headers {
-			newValues := make([]string, len(values))
+			if hopByHopHeaders[key] {
+				continue
+			}
+			newValues := make([]string, 0, len(values))
 			for _, value := range values {
 				newValue := strings.ReplaceAll(value, domain, destinationDomain)
 				newValues = append(newValues, newValue)
@@ -286,7 +303,17 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 
 		contentType := response.Header.Get("Content-Type")
 
+		stripResponseHeaders := map[string]bool{
+			"X-Frame-Options":           true,
+			"Content-Security-Policy":   true,
+			"Content-Security-Policy-Report-Only": true,
+			"Strict-Transport-Security": true,
+		}
+
 		for key, values := range response.Header {
+			if stripResponseHeaders[key] {
+				continue
+			}
 			for _, value := range values {
 				newValue := strings.ReplaceAll(value, destinationDomain, domain)
 				newValue = strings.ReplaceAll(newValue, destinationRootDomain, domain)
@@ -306,7 +333,23 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 			Data:        responseBody,
 		})
 
-	} else {
+	case redirecttype.IFRAME:
+		destination := redirect.Destination
+		html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>* { margin: 0; padding: 0; border: 0; } html, body, iframe { width: 100%%; height: 100%%; display: block; }</style>
+</head>
+<body>
+<iframe src="%s" allowfullscreen></iframe>
+</body>
+</html>`, destination)
+		ginCtx.Header("Content-Type", "text/html; charset=utf-8")
+		ginCtx.String(http.StatusOK, html)
+
+	default:
 		ginCtx.Redirect(http.StatusTemporaryRedirect, redirect.Destination)
 	}
 }

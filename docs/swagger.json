@@ -348,8 +348,13 @@
                 "id": {
                     "type": "string"
                 },
-                "proxy": {
-                    "type": "boolean"
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "PROXY",
+                        "REDIRECT",
+                        "IFRAME"
+                    ]
                 },
                 "updatedAt": {
                     "type": "string"
@@ -365,11 +370,13 @@
                 "dns": {
                     "type": "string"
                 },
-                "proxy": {
-                    "type": "boolean"
-                },
-                "uri": {
-                    "type": "string"
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "PROXY",
+                        "REDIRECT",
+                        "IFRAME"
+                    ]
                 }
             }
         },

@@ -1,0 +1,17 @@
+[
+  {
+    "update": "redirect",
+    "updates": [
+      {
+        "q": { "type": "PROXY" },
+        "u": { "$set": { "proxy": true }, "$unset": { "type": "" } },
+        "multi": true
+      },
+      {
+        "q": { "type": { "$in": ["REDIRECT", "IFRAME"] } },
+        "u": { "$set": { "proxy": false }, "$unset": { "type": "" } },
+        "multi": true
+      }
+    ]
+  }
+]

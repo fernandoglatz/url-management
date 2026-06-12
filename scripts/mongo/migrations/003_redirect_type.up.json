@@ -1,0 +1,22 @@
+[
+  {
+    "update": "redirect",
+    "updates": [
+      {
+        "q": { "proxy": true },
+        "u": { "$set": { "type": "PROXY" }, "$unset": { "proxy": "" } },
+        "multi": true
+      },
+      {
+        "q": { "proxy": false },
+        "u": { "$set": { "type": "REDIRECT" }, "$unset": { "proxy": "" } },
+        "multi": true
+      },
+      {
+        "q": { "proxy": { "$exists": false }, "type": { "$exists": false } },
+        "u": { "$set": { "type": "REDIRECT" }, "$unset": { "proxy": "" } },
+        "multi": true
+      }
+    ]
+  }
+]

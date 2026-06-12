@@ -10,8 +10,12 @@ definitions:
         type: string
       id:
         type: string
-      proxy:
-        type: boolean
+      type:
+        enum:
+        - PROXY
+        - REDIRECT
+        - IFRAME
+        type: string
       updatedAt:
         type: string
     type: object
@@ -21,9 +25,11 @@ definitions:
         type: string
       dns:
         type: string
-      proxy:
-        type: boolean
-      uri:
+      type:
+        enum:
+        - PROXY
+        - REDIRECT
+        - IFRAME
         type: string
     type: object
   response.Response:
