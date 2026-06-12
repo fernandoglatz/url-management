@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"fernandoglatz/url-management/internal/core/common/utils"
@@ -22,6 +23,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/render"
 )
+
+var externalURLPattern = regexp.MustCompile(`url\((['"]?)(https?://[^'")\s,]+)(['"]?)\)`)
+var externalLinkPattern = regexp.MustCompile(`(<link\b[^>]*\bhref=["'])(https?://[^"']+)(["'])`)
+var externalScriptPattern = regexp.MustCompile(`(<script\b[^>]*\bsrc=["'])(https?://[^"']+)(["'])`)
+var quotedURLPattern = regexp.MustCompile(`(["'])(https?://[^"'\s<>]+)(["'])`)
 
 type RedirectController struct {
 	service service.IRedirectService
@@ -251,6 +257,20 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 		headers := ginCtx.Request.Header
 		domain := ginCtx.Request.Host
 
+		scheme := "http"
+		if ginCtx.Request.TLS != nil {
+			scheme = "https"
+		}
+		if proto := ginCtx.GetHeader("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		}
+		proxyBase := scheme + "://" + domain
+		proxyHost, _, _ := net.SplitHostPort(domain)
+		if proxyHost == "" {
+			proxyHost = domain
+		}
+		isHTTPS := scheme == "https"
+
 		if uri == "/" {
 			uri = urlDestination.RequestURI()
 		}
@@ -271,6 +291,7 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 			"Proxy-Authorization": true,
 			"Te":                  true,
 			"Trailers":            true,
+			"Accept-Encoding":     true,
 		}
 
 		request, _ := http.NewRequest(method, destination+uri, body)
@@ -304,10 +325,11 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 		contentType := response.Header.Get("Content-Type")
 
 		stripResponseHeaders := map[string]bool{
-			"X-Frame-Options":           true,
-			"Content-Security-Policy":   true,
+			"X-Frame-Options":                     true,
+			"Content-Security-Policy":             true,
 			"Content-Security-Policy-Report-Only": true,
-			"Strict-Transport-Security": true,
+			"Strict-Transport-Security":           true,
+			"Content-Encoding":                    true,
 		}
 
 		for key, values := range response.Header {
@@ -315,8 +337,16 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 				continue
 			}
 			for _, value := range values {
-				newValue := strings.ReplaceAll(value, destinationDomain, domain)
-				newValue = strings.ReplaceAll(newValue, destinationRootDomain, domain)
+				var newValue string
+				if key == "Set-Cookie" {
+					newValue = rewriteSetCookieHeader(value, destinationDomain, destinationRootDomain, proxyHost, isHTTPS)
+					if newValue == "" {
+						continue
+					}
+				} else {
+					newValue = strings.ReplaceAll(value, destinationDomain, domain)
+					newValue = strings.ReplaceAll(newValue, destinationRootDomain, domain)
+				}
 				ginCtx.Writer.Header().Add(key, newValue)
 			}
 		}
@@ -325,6 +355,7 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 			responseBodyStr := string(responseBody)
 			responseBodyStr = strings.ReplaceAll(responseBodyStr, destinationDomain, domain)
 			responseBodyStr = strings.ReplaceAll(responseBodyStr, destinationRootDomain, domain)
+			responseBodyStr = rewriteExternalURLs(responseBodyStr, proxyBase, proxyHost, destinationRootDomain)
 			responseBody = []byte(responseBodyStr)
 		}
 
@@ -352,6 +383,203 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 	default:
 		ginCtx.Redirect(http.StatusTemporaryRedirect, redirect.Destination)
 	}
+}
+
+func (controller *RedirectController) CDN(ginCtx *gin.Context) {
+	ctx := GetContext(ginCtx)
+	targetURL := ginCtx.Query("url")
+
+	if len(targetURL) == 0 {
+		ginCtx.Status(http.StatusBadRequest)
+		return
+	}
+
+	client := &http.Client{}
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		return
+	}
+
+	req.Header.Set("User-Agent", ginCtx.GetHeader("User-Agent"))
+	if accept := ginCtx.GetHeader("Accept"); accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+
+	response, err := client.Do(req)
+	if err != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		return
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		return
+	}
+
+	contentType := response.Header.Get("Content-Type")
+
+	if isTextBasedContent(contentType) {
+		scheme := "http"
+		if ginCtx.Request.TLS != nil {
+			scheme = "https"
+		}
+		if proto := ginCtx.GetHeader("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		}
+		host := ginCtx.Request.Host
+		proxyBase := scheme + "://" + host
+		proxyHost, _, _ := net.SplitHostPort(host)
+		if proxyHost == "" {
+			proxyHost = host
+		}
+		body = []byte(rewriteExternalURLs(string(body), proxyBase, proxyHost, ""))
+	}
+
+	ginCtx.Header("Access-Control-Allow-Origin", "*")
+	if cc := response.Header.Get("Cache-Control"); cc != "" {
+		ginCtx.Header("Cache-Control", cc)
+	}
+
+	ginCtx.Render(response.StatusCode, render.Data{
+		ContentType: contentType,
+		Data:        body,
+	})
+}
+
+func rewriteExternalURLs(content, proxyBase, proxyHost, destinationRootDomain string) string {
+	cdnURL := func(externalURL string) string {
+		parsed, err := url.Parse(externalURL)
+		if err != nil || parsed.Host == "" {
+			return externalURL
+		}
+		hostname := parsed.Hostname()
+
+		// Exact proxy host — already a valid proxy URL
+		if hostname == proxyHost {
+			return externalURL
+		}
+
+		// Subdomain of proxy host — the root domain replacement incorrectly rewrote a CDN
+		// subdomain (e.g. web-assets.strava.com → web-assets.strava.fernandoglatz.com:8080).
+		// Reverse it back to the original hostname and route through /__cdn.
+		if destinationRootDomain != "" && strings.HasSuffix(hostname, "."+proxyHost) {
+			subdomain := hostname[:len(hostname)-len("."+proxyHost)]
+			reversed, _ := url.Parse(externalURL)
+			if reversed != nil {
+				reversed.Host = subdomain + "." + destinationRootDomain
+				return proxyBase + "/__cdn?url=" + url.QueryEscape(reversed.String())
+			}
+		}
+
+		return proxyBase + "/__cdn?url=" + url.QueryEscape(externalURL)
+	}
+
+	content = externalURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := externalURLPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		quote, externalURL := sub[1], sub[2]
+		return "url(" + quote + cdnURL(externalURL) + quote + ")"
+	})
+
+	content = externalLinkPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := externalLinkPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		prefix, externalURL, quote := sub[1], sub[2], sub[3]
+		return prefix + cdnURL(externalURL) + quote
+	})
+
+	content = externalScriptPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := externalScriptPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		prefix, externalURL, quote := sub[1], sub[2], sub[3]
+		return prefix + cdnURL(externalURL) + quote
+	})
+
+	// Catch-all for quoted URLs not covered by the specific patterns above
+	// (e.g. <img src>, JS strings, JSON values, inline styles).
+	content = quotedURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := quotedURLPattern.FindStringSubmatch(match)
+		if len(sub) < 4 || sub[1] != sub[3] {
+			return match
+		}
+		openQuote, externalURL := sub[1], sub[2]
+		newURL := cdnURL(externalURL)
+		if newURL == externalURL {
+			return match
+		}
+		return openQuote + newURL + openQuote
+	})
+
+	return content
+}
+
+func rewriteSetCookieHeader(value, destinationDomain, destinationRootDomain, proxyHost string, isHTTPS bool) string {
+	parts := strings.Split(value, ";")
+	if len(parts) == 0 {
+		return value
+	}
+
+	nameVal := strings.TrimSpace(parts[0])
+	cookieName := nameVal
+	if idx := strings.IndexByte(nameVal, '='); idx >= 0 {
+		cookieName = nameVal[:idx]
+	}
+	if !isHTTPS && (strings.HasPrefix(cookieName, "__Host-") || strings.HasPrefix(cookieName, "__Secure-")) {
+		return ""
+	}
+
+	hasSecure := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(part), "secure") {
+			hasSecure = true
+			break
+		}
+	}
+
+	result := make([]string, 0, len(parts))
+	result = append(result, parts[0])
+
+	for _, part := range parts[1:] {
+		trimmed := strings.TrimSpace(part)
+		lower := strings.ToLower(trimmed)
+
+		switch {
+		case strings.HasPrefix(lower, "domain="):
+			domainVal := strings.TrimPrefix(trimmed[len("domain="):], ".")
+			if strings.Contains(domainVal, destinationDomain) {
+				domainVal = strings.ReplaceAll(domainVal, destinationDomain, proxyHost)
+			} else if destinationRootDomain != "" && strings.Contains(domainVal, destinationRootDomain) {
+				domainVal = strings.ReplaceAll(domainVal, destinationRootDomain, proxyHost)
+			}
+			result = append(result, " Domain="+domainVal)
+
+		case lower == "secure":
+			if isHTTPS {
+				result = append(result, " Secure")
+			}
+
+		case strings.HasPrefix(lower, "samesite="):
+			if !isHTTPS && strings.TrimPrefix(lower, "samesite=") == "none" && hasSecure {
+				result = append(result, " SameSite=Lax")
+			} else {
+				result = append(result, " "+trimmed)
+			}
+
+		default:
+			result = append(result, " "+trimmed)
+		}
+	}
+
+	return strings.Join(result, ";")
 }
 
 func isTextBasedContent(contentType string) bool {

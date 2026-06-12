@@ -27,6 +27,7 @@ func Setup(ctx context.Context, engine *gin.Engine) {
 	healthController := controller.NewHealthController()
 
 	engine.GET("", redirectController.Execute)
+	engine.GET("/__cdn", redirectController.CDN)
 	router.GET("", redirectController.Execute)
 	router.GET("/", redirectController.Execute) //swagger
 	routerRedirect := router.Group("/redirect")
