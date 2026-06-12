@@ -27,7 +27,7 @@ import (
 var externalURLPattern = regexp.MustCompile(`url\((['"]?)(https?://[^'")\s,]+)(['"]?)\)`)
 var externalLinkPattern = regexp.MustCompile(`(<link\b[^>]*\bhref=["'])(https?://[^"']+)(["'])`)
 var externalScriptPattern = regexp.MustCompile(`(<script\b[^>]*\bsrc=["'])(https?://[^"']+)(["'])`)
-var quotedURLPattern = regexp.MustCompile(`(["'])(https?://[^"'\s<>]+)(["'])`)
+var quotedURLPattern = regexp.MustCompile(`(["'])(https?://[^"'\\\s<>]+)(["'])`)
 
 type RedirectController struct {
 	service service.IRedirectService
