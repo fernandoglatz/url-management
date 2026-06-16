@@ -37,6 +37,24 @@ var integrityAttrPattern = regexp.MustCompile(`(?i)\s+integrity=["'][^"']*["']`)
 var mfeRemoteURLPattern = regexp.MustCompile(`(@)((?:https?:)?//[^\s"'\\<>]+)`)
 var htmlEncodedURLPattern = regexp.MustCompile(`(&quot;)((?:https?:)?//[^&\s<>]+)(&quot;)`)
 
+// Root-relative ("/path") asset references. Used only when the upstream response
+// lands on a different host than the configured destination (cross-host redirect),
+// where these paths belong to the post-redirect host, not the configured one.
+// The leading (/[^/"']) guards against matching protocol-relative "//host" URLs.
+var rootRelLinkPattern = regexp.MustCompile(`(<link\b[^>]*\bhref=["'])(/[^/"'][^"']*)(["'])`)
+var rootRelScriptPattern = regexp.MustCompile(`(<script\b[^>]*\bsrc=["'])(/[^/"'][^"']*)(["'])`)
+var rootRelMediaPattern = regexp.MustCompile(`(<(?:img|source|video|audio)\b[^>]*\bsrc=["'])(/[^/"'][^"']*)(["'])`)
+var rootRelAnchorPattern = regexp.MustCompile(`(<a\b[^>]*\bhref=["'])(/[^/"'][^"']*)(["'])`)
+var rootRelCSSURLPattern = regexp.MustCompile(`url\((['"]?)(/[^/'")][^'")\s,]*)(['"]?)\)`)
+
+// Root-relative asset URLs embedded as JSON string values inside hydration/data
+// blobs (e.g. <script id="props">{..."src":"/cms/assets/...","loading":"/cms/..."}).
+// Client-side frameworks read these to build asset requests after the server-rendered
+// markup, so they must be re-pointed at the post-redirect host like their HTML-tag
+// counterparts. Only asset-looking values are rewritten (see looksLikeAssetPath) so
+// navigation slugs stored in JSON keep flowing through the proxy.
+var rootRelJSONValuePattern = regexp.MustCompile(`("[\w-]+":")(/[^/"][^"]*)(")`)
+
 type RedirectController struct {
 	service service.IRedirectService
 }
@@ -337,6 +355,15 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 
 		contentType := response.Header.Get("Content-Type")
 
+		// Detect a cross-host redirect: the HTTP client follows redirects transparently,
+		// so the body may have come from a host other than the configured destination.
+		// Same-origin root-relative paths in that body belong to the final host.
+		finalHost := destinationDomain
+		if response.Request != nil && response.Request.URL != nil {
+			finalHost = response.Request.URL.Hostname()
+		}
+		crossHost := !strings.EqualFold(finalHost, destinationDomain)
+
 		stripResponseHeaders := map[string]bool{
 			"X-Frame-Options":                     true,
 			"Content-Security-Policy":             true,
@@ -369,6 +396,9 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 			responseBodyStr = strings.ReplaceAll(responseBodyStr, destinationDomain, domain)
 			responseBodyStr = strings.ReplaceAll(responseBodyStr, destinationRootDomain, domain)
 			responseBodyStr = rewriteExternalURLs(responseBodyStr, proxyBase, proxyHost, destinationRootDomain)
+			if crossHost {
+				responseBodyStr = rewriteRootRelativeAssets(responseBodyStr, proxyBase, finalHost)
+			}
 			responseBody = []byte(responseBodyStr)
 		}
 
@@ -539,23 +569,42 @@ func (controller *RedirectController) CDN(ginCtx *gin.Context) {
 func (controller *RedirectController) CDNPath(ginCtx *gin.Context) {
 	ctx := GetContext(ginCtx)
 
-	fullpath := strings.TrimPrefix(ginCtx.Param("fullpath"), "/")
-	slashIdx := strings.IndexByte(fullpath, '/')
-	if slashIdx < 0 {
+	// Use the raw, undecoded request target rather than ginCtx.Param, which is
+	// percent-decoded. Some upstream paths embed an encoded URL as a path segment
+	// (e.g. /cms/assets/https%3A%2F%2F...jpg%3Fw%3D1); decoding it would turn %3F
+	// into a query separator and %2F into path slashes, corrupting the identifier.
+	targetURL, ok := buildCDNPathTarget(ginCtx.Request.RequestURI)
+	if !ok {
 		ginCtx.Status(http.StatusBadRequest)
 		return
 	}
 
-	host := fullpath[:slashIdx]
-	pathPart := fullpath[slashIdx:]
+	controller.serveCDN(ctx, ginCtx, targetURL)
+}
 
-	rawQuery := ginCtx.Request.URL.RawQuery
-	targetURL := "https://" + host + pathPart
+// buildCDNPathTarget reconstructs the upstream URL from a raw "/__cdnp/{host}{/path}"
+// request target, preserving percent-encoding in the path. A real (literal "?")
+// query string is split off and re-appended; encoded "%3F" remains part of the path.
+func buildCDNPathTarget(requestURI string) (string, bool) {
+	raw := strings.TrimPrefix(requestURI, "/__cdnp/")
+
+	rawQuery := ""
+	if qIdx := strings.IndexByte(raw, '?'); qIdx >= 0 {
+		rawQuery = raw[qIdx+1:]
+		raw = raw[:qIdx]
+	}
+
+	slashIdx := strings.IndexByte(raw, '/')
+	if slashIdx < 0 {
+		return "", false
+	}
+
+	targetURL := "https://" + raw[:slashIdx] + raw[slashIdx:]
 	if rawQuery != "" {
 		targetURL += "?" + rawQuery
 	}
 
-	controller.serveCDN(ctx, ginCtx, targetURL)
+	return targetURL, true
 }
 
 func (controller *RedirectController) serveCDN(ctx context.Context, ginCtx *gin.Context, targetURL string) {
@@ -597,7 +646,7 @@ func (controller *RedirectController) serveCDN(ctx context.Context, ginCtx *gin.
 
 	contentType := response.Header.Get("Content-Type")
 
-	if isCSSContent(contentType) {
+	if isHTMLContent(contentType) || isCSSContent(contentType) || isManifestContent(contentType) {
 		scheme := "http"
 		if ginCtx.Request.TLS != nil {
 			scheme = "https"
@@ -611,7 +660,24 @@ func (controller *RedirectController) serveCDN(ctx context.Context, ginCtx *gin.
 		if proxyHost == "" {
 			proxyHost = host
 		}
-		body = []byte(rewriteExternalURLs(string(body), proxyBase, proxyHost, ""))
+
+		// Root-relative URLs inside a resource fetched through /__cdnp/<targetHost> belong
+		// to that host, but a browser resolves them against the proxy origin root and 404s.
+		// Re-point them at /__cdnp/<targetHost> so the whole page (and its fonts, icons,
+		// and navigation) keeps resolving through the proxy.
+		targetHost := ""
+		if parsed, parseErr := url.Parse(targetURL); parseErr == nil {
+			targetHost = parsed.Host
+		}
+
+		switch {
+		case isHTMLContent(contentType):
+			body = []byte(rewriteCDNHTML(string(body), proxyBase, proxyHost, targetHost))
+		case isCSSContent(contentType):
+			body = []byte(rewriteCDNCSS(string(body), proxyBase, proxyHost, targetHost))
+		case isManifestContent(contentType):
+			body = []byte(rewriteCDNManifest(string(body), proxyBase, targetHost))
+		}
 	}
 
 	ginCtx.Header("Access-Control-Allow-Origin", "*")
@@ -775,6 +841,147 @@ func rewriteExternalURLs(content, proxyBase, proxyHost, destinationRootDomain st
 	return content
 }
 
+// rewriteRootRelativeAssets re-points same-origin root-relative asset references
+// ("/path") at the post-redirect host via the /__cdnp proxy. It runs only on
+// cross-host redirects, where these paths live on the final host rather than the
+// configured destination. Only asset-bearing contexts are rewritten — <a> links
+// are intentionally left on the proxy host so in-proxy navigation keeps working.
+func rewriteRootRelativeAssets(content, proxyBase, finalHost string) string {
+	prefix := proxyBase + "/__cdnp/" + finalHost
+
+	rewriteTagAttr := func(pattern *regexp.Regexp) {
+		content = pattern.ReplaceAllStringFunc(content, func(match string) string {
+			sub := pattern.FindStringSubmatch(match)
+			if len(sub) < 4 {
+				return match
+			}
+			return sub[1] + prefix + sub[2] + sub[3]
+		})
+	}
+
+	rewriteTagAttr(rootRelLinkPattern)
+	rewriteTagAttr(rootRelScriptPattern)
+	rewriteTagAttr(rootRelMediaPattern)
+
+	content = rootRelCSSURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := rootRelCSSURLPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		return "url(" + sub[1] + prefix + sub[2] + sub[3] + ")"
+	})
+
+	// srcset entries are comma-separated "URL descriptor" pairs; rewrite the
+	// root-relative ones (absolute entries were already handled upstream).
+	content = externalSrcsetPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := externalSrcsetPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		entries := strings.Split(sub[2], ",")
+		for i, entry := range entries {
+			trimmed := strings.TrimLeft(entry, " \t")
+			lead := entry[:len(entry)-len(trimmed)]
+			if strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, "//") {
+				entries[i] = lead + prefix + trimmed
+			}
+		}
+		return sub[1] + strings.Join(entries, ",") + sub[3]
+	})
+
+	// Root-relative asset URLs carried as JSON string values in hydration blobs.
+	content = rootRelJSONValuePattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := rootRelJSONValuePattern.FindStringSubmatch(match)
+		if len(sub) < 4 || !looksLikeAssetPath(sub[2]) {
+			return match
+		}
+		return sub[1] + prefix + sub[2] + sub[3]
+	})
+
+	return content
+}
+
+// looksLikeAssetPath reports whether a root-relative JSON value points at a fetchable
+// asset rather than an in-app navigation target. Two signals mark an asset: an embedded
+// percent-encoded URL (e.g. /cms/assets/https%3A%2F%2F...) or a file extension on the
+// last path segment (e.g. /website_assets/app.css). Navigation slugs like
+// /topics/whats-new have neither and are left untouched.
+func looksLikeAssetPath(value string) bool {
+	if strings.Contains(value, "%2F") || strings.Contains(value, "%3A") {
+		return true
+	}
+
+	path := value
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	segment := path[strings.LastIndexByte(path, '/')+1:]
+	dot := strings.LastIndexByte(segment, '.')
+	return dot > 0 && dot < len(segment)-1
+}
+
+// rewriteCDNHTML rewrites an HTML page fetched through the /__cdnp proxy so it renders
+// correctly: external/absolute URLs (including same-host ones) are routed through
+// /__cdnp/<host>, and root-relative assets and <a> navigation are re-pointed at
+// /__cdnp/<targetHost>. Together this keeps the whole page — and clicks within it —
+// flowing back through the proxy instead of escaping to the origin or 404ing.
+func rewriteCDNHTML(content, proxyBase, proxyHost, targetHost string) string {
+	content = rewriteExternalURLs(content, proxyBase, proxyHost, "")
+	content = rewriteRootRelativeAssets(content, proxyBase, targetHost)
+	content = rewriteRootRelativeAnchors(content, proxyBase, targetHost)
+	return content
+}
+
+// rewriteCDNCSS rewrites a stylesheet fetched through /__cdnp: external url() references
+// are routed through /__cdnp/<host>, and root-relative url() references (e.g. @font-face
+// src:url('/fonts/x.otf')) are re-pointed at /__cdnp/<targetHost> so they resolve against
+// the host that serves them rather than the proxy origin root.
+func rewriteCDNCSS(content, proxyBase, proxyHost, targetHost string) string {
+	content = rewriteExternalURLs(content, proxyBase, proxyHost, "")
+
+	prefix := proxyBase + "/__cdnp/" + targetHost
+	content = rootRelCSSURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := rootRelCSSURLPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		return "url(" + sub[1] + prefix + sub[2] + sub[3] + ")"
+	})
+
+	return content
+}
+
+// rewriteCDNManifest re-points root-relative asset URLs carried as JSON string values
+// (e.g. a web manifest's icon "src":"/android-chrome-144x144.png") at /__cdnp/<targetHost>.
+// Only asset-looking values are rewritten (see looksLikeAssetPath), so navigation values
+// like "start_url" keep resolving against the proxy host.
+func rewriteCDNManifest(content, proxyBase, targetHost string) string {
+	prefix := proxyBase + "/__cdnp/" + targetHost
+	return rootRelJSONValuePattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := rootRelJSONValuePattern.FindStringSubmatch(match)
+		if len(sub) < 4 || !looksLikeAssetPath(sub[2]) {
+			return match
+		}
+		return sub[1] + prefix + sub[2] + sub[3]
+	})
+}
+
+// rewriteRootRelativeAnchors routes root-relative <a> navigation through
+// /__cdnp/<finalHost>. Unlike rewriteRootRelativeAssets (which leaves <a> alone so the
+// top-level proxied page keeps in-proxy navigation), a page already rendered under
+// /__cdnp must keep its own navigation under the same prefix, or root-relative links
+// would resolve against the proxy root and lose the host context.
+func rewriteRootRelativeAnchors(content, proxyBase, finalHost string) string {
+	prefix := proxyBase + "/__cdnp/" + finalHost
+	return rootRelAnchorPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := rootRelAnchorPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		return sub[1] + prefix + sub[2] + sub[3]
+	})
+}
+
 func rewriteSetCookieHeader(value, destinationDomain, destinationRootDomain, proxyHost string, isHTTPS bool) string {
 	parts := strings.Split(value, ";")
 	if len(parts) == 0 {
@@ -837,6 +1044,22 @@ func rewriteSetCookieHeader(value, destinationDomain, destinationRootDomain, pro
 
 func isCSSContent(contentType string) bool {
 	return strings.Contains(strings.ToLower(contentType), "text/css")
+}
+
+func isHTMLContent(contentType string) bool {
+	contentTypeLower := strings.ToLower(contentType)
+	return strings.Contains(contentTypeLower, "text/html") ||
+		strings.Contains(contentTypeLower, "application/xhtml+xml")
+}
+
+// isManifestContent matches web manifests and JSON responses. Such bodies may carry
+// root-relative asset URLs (icons, images) that, when served through /__cdnp, must be
+// re-pointed at the target host. Rewriting is asset-gated, so non-asset JSON data is
+// left untouched.
+func isManifestContent(contentType string) bool {
+	contentTypeLower := strings.ToLower(contentType)
+	return strings.Contains(contentTypeLower, "application/manifest+json") ||
+		strings.Contains(contentTypeLower, "application/json")
 }
 
 func isTextBasedContent(contentType string) bool {
