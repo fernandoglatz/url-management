@@ -8,6 +8,8 @@ import (
 	"fernandoglatz/url-management/internal/core/entity"
 	"fernandoglatz/url-management/internal/core/port/repository"
 	"fernandoglatz/url-management/internal/infrastructure/config"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const REDIRECT_CACHE_KEY_PREFIX = "url-management:redirect:"
@@ -26,7 +28,10 @@ func (cacheRepository *RedirectCacheRepository) Get(ctx context.Context, id stri
 	cacheKey := REDIRECT_CACHE_KEY_PREFIX + id
 	var redirect entity.Redirect
 	cacheErr := utils.RedisDatabase.GetStruct(ctx, cacheKey, &redirect)
-	if cacheErr != nil {
+	if cacheErr == nil {
+		return redirect, nil
+	}
+	if cacheErr != redis.Nil {
 		log.Error(ctx).Msg("Error retrieving redirect from cache: " + cacheErr.Error())
 	}
 	redirect, errw := cacheRepository.repository.Get(ctx, id)
@@ -44,7 +49,10 @@ func (cacheRepository *RedirectCacheRepository) GetByDNS(ctx context.Context, dn
 	cacheKey := REDIRECT_CACHE_KEY_PREFIX + dns
 	var redirect entity.Redirect
 	cacheErr := utils.RedisDatabase.GetStruct(ctx, cacheKey, &redirect)
-	if cacheErr != nil {
+	if cacheErr == nil {
+		return redirect, nil
+	}
+	if cacheErr != redis.Nil {
 		log.Error(ctx).Msg("Error retrieving redirect by DNS from cache: " + cacheErr.Error())
 	}
 	redirect, errw := cacheRepository.repository.GetByDNS(ctx, dns)

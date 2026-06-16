@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fernandoglatz/url-management/internal/core/common/utils/constants"
 	"fernandoglatz/url-management/internal/core/common/utils/exceptions"
@@ -17,6 +19,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	"fernandoglatz/url-management/internal/core/common/utils"
 
@@ -24,10 +27,15 @@ import (
 	"github.com/gin-gonic/gin/render"
 )
 
-var externalURLPattern = regexp.MustCompile(`url\((['"]?)(https?://[^'")\s,]+)(['"]?)\)`)
-var externalLinkPattern = regexp.MustCompile(`(<link\b[^>]*\bhref=["'])(https?://[^"']+)(["'])`)
-var externalScriptPattern = regexp.MustCompile(`(<script\b[^>]*\bsrc=["'])(https?://[^"']+)(["'])`)
-var quotedURLPattern = regexp.MustCompile(`(["'])(https?://[^"'\\\s<>]+)(["'])`)
+var externalURLPattern = regexp.MustCompile(`url\((['"]?)((?:https?:)?//[^'")\s,]+)(['"]?)\)`)
+var externalLinkPattern = regexp.MustCompile(`(<link\b[^>]*\bhref=["'])((?:https?:)?//[^"']+)(["'])`)
+var externalScriptPattern = regexp.MustCompile(`(<script\b[^>]*\bsrc=["'])((?:https?:)?//[^"']+)(["'])`)
+var quotedURLPattern = regexp.MustCompile(`(?:(\w+(?::\w+)*)=)?(["'])((?:https?:)?//[^"'\\\s<>]+)(["'])`)
+var externalSrcsetPattern = regexp.MustCompile(`(?i)(\bsrcset=["'])([^"']+)(["'])`)
+var srcsetEntryURLPattern = regexp.MustCompile(`((?:https?:)?//[^\s,]+)`)
+var integrityAttrPattern = regexp.MustCompile(`(?i)\s+integrity=["'][^"']*["']`)
+var mfeRemoteURLPattern = regexp.MustCompile(`(@)((?:https?:)?//[^\s"'\\<>]+)`)
+var htmlEncodedURLPattern = regexp.MustCompile(`(&quot;)((?:https?:)?//[^&\s<>]+)(&quot;)`)
 
 type RedirectController struct {
 	service service.IRedirectService
@@ -243,13 +251,18 @@ func (controller *RedirectController) NoRoute(ginCtx *gin.Context) {
 func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.Context, redirect entity.Redirect) {
 	switch redirect.Type {
 	case redirecttype.PROXY:
-		client := &http.Client{}
-
 		urlDestination, err := url.Parse(redirect.Destination)
 		if err != nil {
 			HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
 			return
 		}
+
+		if strings.EqualFold(ginCtx.Request.Header.Get("Upgrade"), "websocket") {
+			controller.proxyWebSocket(ginCtx, urlDestination)
+			return
+		}
+
+		client := &http.Client{}
 
 		uri := ginCtx.Request.RequestURI
 		body := ginCtx.Request.Body
@@ -385,6 +398,128 @@ func (controller *RedirectController) redirect(ctx context.Context, ginCtx *gin.
 	}
 }
 
+func (controller *RedirectController) proxyWebSocket(ginCtx *gin.Context, destination *url.URL) {
+	ctx := GetContext(ginCtx)
+
+	upstreamHost := destination.Host
+	if destination.Port() == "" {
+		switch strings.ToLower(destination.Scheme) {
+		case "https", "wss":
+			upstreamHost = destination.Hostname() + ":443"
+		default:
+			upstreamHost = destination.Hostname() + ":80"
+		}
+	}
+
+	var upstreamConn net.Conn
+	var dialErr error
+	scheme := strings.ToLower(destination.Scheme)
+	if scheme == "https" || scheme == "wss" {
+		upstreamConn, dialErr = tls.Dial("tcp", upstreamHost, &tls.Config{ServerName: destination.Hostname()})
+	} else {
+		upstreamConn, dialErr = net.Dial("tcp", upstreamHost)
+	}
+	if dialErr != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: dialErr})
+		return
+	}
+	defer upstreamConn.Close()
+
+	uri := ginCtx.Request.RequestURI
+	if uri == "/" {
+		uri = destination.RequestURI()
+	}
+
+	upstreamURL := *destination
+	if parsed, parseErr := url.ParseRequestURI(uri); parseErr == nil {
+		upstreamURL.Path = parsed.Path
+		upstreamURL.RawPath = parsed.RawPath
+		upstreamURL.RawQuery = parsed.RawQuery
+	}
+
+	upstreamReq, _ := http.NewRequest(ginCtx.Request.Method, upstreamURL.String(), ginCtx.Request.Body)
+	upstreamReq.Host = destination.Host
+
+	domain := ginCtx.Request.Host
+	wsHopByHop := map[string]bool{
+		"Keep-Alive":          true,
+		"Proxy-Connection":    true,
+		"Transfer-Encoding":   true,
+		"Proxy-Authenticate":  true,
+		"Proxy-Authorization": true,
+		"Te":                  true,
+		"Trailers":            true,
+	}
+	for key, values := range ginCtx.Request.Header {
+		if wsHopByHop[key] {
+			continue
+		}
+		newValues := make([]string, 0, len(values))
+		for _, v := range values {
+			newValues = append(newValues, strings.ReplaceAll(v, domain, destination.Host))
+		}
+		upstreamReq.Header[key] = newValues
+	}
+
+	if err := upstreamReq.Write(upstreamConn); err != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		return
+	}
+
+	upstreamReader := bufio.NewReader(upstreamConn)
+	upstreamResp, err := http.ReadResponse(upstreamReader, upstreamReq)
+	if err != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		return
+	}
+	if upstreamResp.StatusCode != http.StatusSwitchingProtocols {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{
+			Error: fmt.Errorf("WebSocket upstream returned %d, expected 101", upstreamResp.StatusCode),
+		})
+		return
+	}
+
+	hijacker, ok := ginCtx.Writer.(http.Hijacker)
+	if !ok {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{
+			Error: fmt.Errorf("response writer does not support hijacking"),
+		})
+		return
+	}
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		return
+	}
+	defer clientConn.Close()
+
+	if err := upstreamResp.Write(clientBuf); err != nil {
+		log.Error(ctx).Msg("Failed to write WebSocket 101 response to client: " + err.Error())
+		return
+	}
+	if err := clientBuf.Flush(); err != nil {
+		log.Error(ctx).Msg("Failed to flush WebSocket 101 response to client: " + err.Error())
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(upstreamConn, clientBuf)
+		upstreamConn.Close()
+	}()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(clientConn, upstreamReader)
+		clientConn.Close()
+	}()
+
+	wg.Wait()
+}
+
 func (controller *RedirectController) CDN(ginCtx *gin.Context) {
 	ctx := GetContext(ginCtx)
 	targetURL := ginCtx.Query("url")
@@ -394,6 +529,36 @@ func (controller *RedirectController) CDN(ginCtx *gin.Context) {
 		return
 	}
 
+	controller.serveCDN(ctx, ginCtx, targetURL)
+}
+
+// CDNPath proxies an external resource identified by /__cdnp/{host}{/path}.
+// Unlike CDN (which uses a ?url= query parameter), the target host and path are
+// encoded in the URL path itself so that webpack's auto publicPath detection
+// strips to the correct directory when computing relative chunk URLs.
+func (controller *RedirectController) CDNPath(ginCtx *gin.Context) {
+	ctx := GetContext(ginCtx)
+
+	fullpath := strings.TrimPrefix(ginCtx.Param("fullpath"), "/")
+	slashIdx := strings.IndexByte(fullpath, '/')
+	if slashIdx < 0 {
+		ginCtx.Status(http.StatusBadRequest)
+		return
+	}
+
+	host := fullpath[:slashIdx]
+	pathPart := fullpath[slashIdx:]
+
+	rawQuery := ginCtx.Request.URL.RawQuery
+	targetURL := "https://" + host + pathPart
+	if rawQuery != "" {
+		targetURL += "?" + rawQuery
+	}
+
+	controller.serveCDN(ctx, ginCtx, targetURL)
+}
+
+func (controller *RedirectController) serveCDN(ctx context.Context, ginCtx *gin.Context, targetURL string) {
 	client := &http.Client{}
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -405,23 +570,34 @@ func (controller *RedirectController) CDN(ginCtx *gin.Context) {
 	if accept := ginCtx.GetHeader("Accept"); accept != "" {
 		req.Header.Set("Accept", accept)
 	}
+	if lang := ginCtx.GetHeader("Accept-Language"); lang != "" {
+		req.Header.Set("Accept-Language", lang)
+	}
+	if cookie := ginCtx.GetHeader("Cookie"); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	if parsed, parseErr := url.Parse(targetURL); parseErr == nil && parsed.Host != "" {
+		req.Header.Set("Referer", parsed.Scheme+"://"+parsed.Host+"/")
+	}
 
 	response, err := client.Do(req)
 	if err != nil {
-		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		log.Error(ctx).Msg("CDN proxy fetch error for " + targetURL + ": " + err.Error())
+		ginCtx.Status(http.StatusBadGateway)
 		return
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		HandleError(ctx, ginCtx, &exceptions.WrappedError{Error: err})
+		log.Error(ctx).Msg("CDN proxy read error for " + targetURL + ": " + err.Error())
+		ginCtx.Status(http.StatusBadGateway)
 		return
 	}
 
 	contentType := response.Header.Get("Content-Type")
 
-	if isTextBasedContent(contentType) {
+	if isCSSContent(contentType) {
 		scheme := "http"
 		if ginCtx.Request.TLS != nil {
 			scheme = "https"
@@ -451,30 +627,41 @@ func (controller *RedirectController) CDN(ginCtx *gin.Context) {
 
 func rewriteExternalURLs(content, proxyBase, proxyHost, destinationRootDomain string) string {
 	cdnURL := func(externalURL string) string {
-		parsed, err := url.Parse(externalURL)
+		normalizedURL := externalURL
+		if strings.HasPrefix(externalURL, "//") {
+			normalizedURL = "https:" + externalURL
+		}
+
+		parsed, err := url.Parse(normalizedURL)
 		if err != nil || parsed.Host == "" {
 			return externalURL
 		}
 		hostname := parsed.Hostname()
 
-		// Exact proxy host — already a valid proxy URL
-		if hostname == proxyHost {
+		// Reject non-hostname paths like //api/endpoint (no dot = not an external host)
+		if !strings.Contains(hostname, ".") {
 			return externalURL
+		}
+
+		// Exact proxy host — normalize to the proxy's scheme/host so that https://
+		// references don't cause SSL errors when the proxy is running over HTTP.
+		if hostname == proxyHost {
+			return proxyBase + parsed.RequestURI()
 		}
 
 		// Subdomain of proxy host — the root domain replacement incorrectly rewrote a CDN
 		// subdomain (e.g. web-assets.strava.com → web-assets.strava.fernandoglatz.com:8080).
-		// Reverse it back to the original hostname and route through /__cdn.
+		// Reverse it back to the original hostname and route through /__cdnp.
 		if destinationRootDomain != "" && strings.HasSuffix(hostname, "."+proxyHost) {
 			subdomain := hostname[:len(hostname)-len("."+proxyHost)]
-			reversed, _ := url.Parse(externalURL)
+			reversed, _ := url.Parse(normalizedURL)
 			if reversed != nil {
 				reversed.Host = subdomain + "." + destinationRootDomain
-				return proxyBase + "/__cdn?url=" + url.QueryEscape(reversed.String())
+				return proxyBase + "/__cdnp/" + reversed.Hostname() + reversed.RequestURI()
 			}
 		}
 
-		return proxyBase + "/__cdn?url=" + url.QueryEscape(externalURL)
+		return proxyBase + "/__cdnp/" + parsed.Hostname() + parsed.RequestURI()
 	}
 
 	content = externalURLPattern.ReplaceAllStringFunc(content, func(match string) string {
@@ -508,16 +695,82 @@ func rewriteExternalURLs(content, proxyBase, proxyHost, destinationRootDomain st
 	// (e.g. <img src>, JS strings, JSON values, inline styles).
 	content = quotedURLPattern.ReplaceAllStringFunc(content, func(match string) string {
 		sub := quotedURLPattern.FindStringSubmatch(match)
-		if len(sub) < 4 || sub[1] != sub[3] {
+		if len(sub) < 5 || sub[2] != sub[4] {
 			return match
 		}
-		openQuote, externalURL := sub[1], sub[2]
+		attrName, openQuote, externalURL := sub[1], sub[2], sub[3]
+		// xmlns attributes are XML namespace identifiers, not fetchable URLs
+		if strings.HasPrefix(attrName, "xmlns") {
+			return match
+		}
 		newURL := cdnURL(externalURL)
 		if newURL == externalURL {
 			return match
 		}
-		return openQuote + newURL + openQuote
+		prefix := ""
+		if attrName != "" {
+			prefix = attrName + "="
+		}
+		return prefix + openQuote + newURL + openQuote
 	})
+
+	// srcset attributes (img/source) contain space-separated "URL descriptor" entries
+	// separated by commas; quotedURLPattern can't match them because URLs are followed
+	// by a space+descriptor before the closing quote. Handle both srcset and srcSet (React).
+	content = externalSrcsetPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := externalSrcsetPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		prefix, srcsetValue, closingQuote := sub[1], sub[2], sub[3]
+		newValue := srcsetEntryURLPattern.ReplaceAllStringFunc(srcsetValue, func(u string) string {
+			return cdnURL(u)
+		})
+		return prefix + newValue + closingQuote
+	})
+
+	// URLs inside HTML attribute values with entity-encoded quotes (&quot;...&quot;)
+	// e.g. data-react-props='{"url":"https://..."}'. The quotedURLPattern only matches
+	// real " or ' characters, so these are invisible to it.
+	// Only rewrite proxy-subdomain URLs (produced by the earlier text replacement) to
+	// avoid corrupting third-party URLs that use JSON & escapes for & in query params.
+	content = htmlEncodedURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := htmlEncodedURLPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		parsed, parseErr := url.Parse(sub[2])
+		if parseErr != nil || parsed.Host == "" {
+			return match
+		}
+		hostname := parsed.Hostname()
+		if destinationRootDomain == "" || !strings.HasSuffix(hostname, "."+proxyHost) {
+			return match
+		}
+		newURL := cdnURL(sub[2])
+		if newURL == sub[2] {
+			return match
+		}
+		return sub[1] + newURL + sub[3]
+	})
+
+	// Module Federation remote entry format: "scope@https://..." — the URL follows "@"
+	// and is not at the start of the quoted string so quotedURLPattern misses it.
+	content = mfeRemoteURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := mfeRemoteURLPattern.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		newURL := cdnURL(sub[2])
+		if newURL == sub[2] {
+			return match
+		}
+		return sub[1] + newURL
+	})
+
+	// Strip SRI integrity attributes: proxied content is served through /__cdn which may
+	// modify text content (URL rewriting), so the original hash will never match.
+	content = integrityAttrPattern.ReplaceAllString(content, "")
 
 	return content
 }
@@ -580,6 +833,10 @@ func rewriteSetCookieHeader(value, destinationDomain, destinationRootDomain, pro
 	}
 
 	return strings.Join(result, ";")
+}
+
+func isCSSContent(contentType string) bool {
+	return strings.Contains(strings.ToLower(contentType), "text/css")
 }
 
 func isTextBasedContent(contentType string) bool {

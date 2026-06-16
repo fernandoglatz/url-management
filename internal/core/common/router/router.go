@@ -28,6 +28,7 @@ func Setup(ctx context.Context, engine *gin.Engine) {
 
 	engine.GET("", redirectController.Execute)
 	engine.GET("/__cdn", redirectController.CDN)
+	engine.GET("/__cdnp/*fullpath", redirectController.CDNPath)
 	router.GET("", redirectController.Execute)
 	router.GET("/", redirectController.Execute) //swagger
 	routerRedirect := router.Group("/redirect")
