@@ -14,9 +14,20 @@ A Go service for managing URL redirects with support for three redirect strategi
 
 | Type | Behavior |
 |------|----------|
-| `PROXY` | Transparent reverse proxy — forwards the full request to the destination and rewrites domain references in response headers/body |
+| `PROXY` | Transparent reverse proxy — forwards requests to the destination, rewrites domain and external URL references in headers/body, proxies WebSocket upgrades, and strips browser-blocking headers (CSP, HSTS, X-Frame-Options) |
 | `REDIRECT` | HTTP 307 Temporary Redirect to the destination URL |
 | `IFRAME` | Serves a full-page iframe wrapping the destination URL |
+
+### Proxy mode details
+
+When `type` is `PROXY`, the service acts as a full reverse proxy:
+
+- **Domain rewriting** — replaces the destination domain with the proxy domain in response headers and text-based bodies (HTML, CSS, JS, JSON, XML, etc.)
+- **External URL rewriting** — rewrites external URLs in `src`, `href`, `url()`, `srcset`, `@import`, Module Federation remotes, and HTML entity-encoded values through the built-in CDN proxy (`/__cdnp/`)
+- **WebSocket** — transparently tunnels WebSocket connections (plain and TLS) to the upstream host
+- **Cookie rewriting** — adjusts `Set-Cookie` `Domain`, `Secure`, and `SameSite` attributes to match the proxy host
+- **Hop-by-hop header filtering** — strips `Connection`, `Transfer-Encoding`, `Upgrade`, etc. per RFC 7230
+- **SRI stripping** — removes `integrity` attributes from `<script>` and `<link>` tags whose content has been rewritten
 
 ## Getting Started
 
@@ -76,7 +87,7 @@ Environment variables are loaded from `.env` at startup.
 
 Base path: `/url-management`
 
-Swagger UI is available at `/url-management/swagger/index.html`.
+Swagger UI is available at `/url-management/swagger-ui/index.html`.
 
 ### Redirect management
 
@@ -95,6 +106,15 @@ Swagger UI is available at `/url-management/swagger/index.html`.
 |--------|------|-------------|
 | `GET` | `/?to={id}` | Execute redirect by ID |
 | `GET` | `/*` | DNS-based redirect (matches the request hostname) |
+
+### CDN proxy (used internally by PROXY mode)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/__cdn?url={url}` | Proxy an external resource by URL query parameter |
+| `GET` | `/__cdnp/{host}/{path}` | Proxy an external resource with target host and path encoded in the URL path (preserves webpack `publicPath` detection) |
+
+Both endpoints rewrite external URLs in CSS responses so that nested assets are also routed through the proxy.
 
 ### Health
 
